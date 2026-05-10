@@ -1,0 +1,105 @@
+name: Fetch Large File
+
+# Triggered by kevin-proxy's GitHubDispatcher (src/github_dispatch.py).
+# Workflow runs on GitHub-hosted runners (unfiltered IPs from Iran),
+# downloads the requested URL, computes sha256, and uploads as a
+# release asset under a deterministic tag = sha256(url)[:16] so the
+# dispatcher can poll for completion by tag name.
+#
+# Idempotency: if a release with the same tag already exists, the
+# workflow skips the download and exits 0 — the dispatcher will see
+# the existing asset on its next poll and short-circuit.
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'URL to fetch (HTTP or video-site)'
+        required: true
+      asset_name:
+        description: 'Output file name (just the basename)'
+        required: true
+      tag:
+        description: 'Release tag (deterministic, supplied by dispatcher)'
+        required: true
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - name: Idempotency check
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "release exists, skipping download"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Sanitize asset name
+        id: name
+        if: steps.check.outputs.exists == 'false'
+        env:
+          RAW: ${{ inputs.asset_name }}
+        run: |
+          # Allow alphanumerics, dot, underscore, hyphen. Anything else → underscore.
+          # Limit to 200 chars. This blocks path traversal and command injection.
+          SAFE="$(echo -n "$RAW" | tr -c 'A-Za-z0-9._-' '_' | head -c 200)"
+          if [[ -z "$SAFE" ]]; then SAFE="download.bin"; fi
+          echo "safe=$SAFE" >> "$GITHUB_OUTPUT"
+
+      - name: Download
+        if: steps.check.outputs.exists == 'false'
+        env:
+          URL:  ${{ inputs.url }}
+          NAME: ${{ steps.name.outputs.safe }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          # Pick downloader based on URL host. Treat URL as data, never let it
+          # interpolate into a shell command — pass via env or argv only.
+          host="$(python3 -c 'import sys, urllib.parse as u; print((u.urlparse(sys.argv[1]).hostname or "").lower())' "$URL")"
+          case "$host" in
+            *youtube.com|*youtu.be|*vimeo.com|*twitch.tv|*soundcloud.com|*dailymotion.com)
+              echo "Detected video host: $host (using yt-dlp)"
+              python3 -m pip install --quiet yt-dlp
+              python3 -m yt_dlp -o "out/${NAME}" "$URL"
+              ;;
+            *)
+              echo "Generic host: $host (using curl)"
+              curl -L --fail --max-time 1800 -o "out/${NAME}" -- "$URL"
+              ;;
+          esac
+          # If yt-dlp wrote a different extension (likely), find the actual file
+          ACTUAL="$(find out -maxdepth 1 -type f -name "${NAME}*" | head -1)"
+          if [[ "$ACTUAL" != "out/${NAME}" && -n "$ACTUAL" ]]; then
+            mv "$ACTUAL" "out/${NAME}"
+          fi
+          ls -lh out/
+          sha256sum "out/${NAME}" | awk '{print $1}' > "out/${NAME}.sha256"
+
+      - name: Create release with asset
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+          TAG:      ${{ inputs.tag }}
+          NAME:     ${{ steps.name.outputs.safe }}
+          URL:      ${{ inputs.url }}
+        run: |
+          set -euo pipefail
+          # Body kept short; URL printed verbatim and treated as text only.
+          NOTES="$(printf 'Source: %s\nFetched: %s' "$URL" "$(date -u +%Y-%m-%dT%H:%M:%SZ)")"
+          gh release create "$TAG" \
+            "out/${NAME}" "out/${NAME}.sha256" \
+            --repo "$REPO" \
+            --title "fetch: $NAME" \
+            --notes "$NOTES"
