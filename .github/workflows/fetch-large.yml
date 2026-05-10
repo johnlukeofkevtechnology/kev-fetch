@@ -92,8 +92,12 @@ jobs:
                 fi
               fi
               # Player-client fallback chain — first that works wins.
+              # --remote-components ejs:github downloads the YouTube n-challenge
+              # solver, which is needed to decode signed streaming URLs when
+              # using cookies (the cookied tv/web client paths require it).
               python3 -m yt_dlp $JS_RUNTIME_FLAG $COOKIES_FLAG \
-                --extractor-args 'youtube:player_client=tv,android,ios,web' \
+                --remote-components ejs:github \
+                --extractor-args 'youtube:player_client=tv,web,android,ios' \
                 --no-playlist \
                 --format 'best[height<=720]/best' \
                 -o "out/${NAME}" "$URL" || {
