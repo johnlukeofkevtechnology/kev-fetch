@@ -59,8 +59,9 @@ jobs:
       - name: Download
         if: steps.check.outputs.exists == 'false'
         env:
-          URL:  ${{ inputs.url }}
-          NAME: ${{ steps.name.outputs.safe }}
+          URL:        ${{ inputs.url }}
+          NAME:       ${{ steps.name.outputs.safe }}
+          YT_COOKIES: ${{ secrets.YT_COOKIES }}
         run: |
           set -euo pipefail
           mkdir -p out
@@ -71,25 +72,38 @@ jobs:
             *youtube.com|*youtu.be|*vimeo.com|*twitch.tv|*soundcloud.com|*dailymotion.com)
               echo "Detected video host: $host (using yt-dlp)"
               python3 -m pip install --quiet yt-dlp
-              # YouTube requires a JS runtime for signed-URL extraction.
-              # GitHub-hosted runners come with Node already; expose its path.
+              # YouTube requires a JS runtime; node is preinstalled on runners.
               if command -v node >/dev/null 2>&1; then
                 JS_RUNTIME_FLAG="--js-runtimes node:$(command -v node)"
               else
                 JS_RUNTIME_FLAG=""
               fi
-              # GitHub runner IPs trigger YouTube's bot challenge. The android
-              # and android_creator player clients use a separate API path that
-              # tolerates these IPs in many cases. Try several clients in order.
-              python3 -m yt_dlp $JS_RUNTIME_FLAG \
-                --extractor-args 'youtube:player_client=android,android_creator,ios,web' \
+              # YouTube bot-checks GitHub runner IPs. If the operator stored
+              # YouTube cookies as the YT_COOKIES repo secret (base64-encoded
+              # Netscape-format cookies.txt), use them. See setup/refresh-yt-cookies.sh.
+              COOKIES_FLAG=""
+              if [[ -n "${YT_COOKIES:-}" ]]; then
+                echo "$YT_COOKIES" | base64 -d > /tmp/yt-cookies.txt 2>/dev/null
+                if [[ -s /tmp/yt-cookies.txt ]]; then
+                  COOKIES_FLAG="--cookies /tmp/yt-cookies.txt"
+                  echo "  using YT_COOKIES secret ($(wc -l < /tmp/yt-cookies.txt) cookie lines)"
+                else
+                  echo "  WARNING: YT_COOKIES set but base64 decode produced empty file; ignoring"
+                fi
+              fi
+              # Player-client fallback chain — first that works wins.
+              python3 -m yt_dlp $JS_RUNTIME_FLAG $COOKIES_FLAG \
+                --extractor-args 'youtube:player_client=tv,android,ios,web' \
                 --no-playlist \
                 --format 'best[height<=720]/best' \
                 -o "out/${NAME}" "$URL" || {
-                  echo "yt-dlp failed; the URL may be region/age-restricted or YouTube's anti-bot just blocked this runner IP."
-                  echo "Workaround: re-run, or supply cookies via repo secret YT_COOKIES (not implemented yet)."
+                  echo "yt-dlp failed."
+                  echo "  - For YouTube: GitHub runner IPs are bot-flagged; refresh cookies via setup/refresh-yt-cookies.sh"
+                  echo "  - Other sites: URL may be region/age-restricted or yt-dlp's extractor for it is broken upstream"
+                  rm -f /tmp/yt-cookies.txt
                   exit 1
                 }
+              rm -f /tmp/yt-cookies.txt
               ;;
             *)
               echo "Generic host: $host (using curl)"
